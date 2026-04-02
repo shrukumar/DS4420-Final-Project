@@ -1,0 +1,211 @@
+---
+title: "DS4420 Final Project Bayes Model"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+# download required libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+```{r}
+# load our dataset (daily training data)
+df <- read.csv("run_ww_2019_d.csv")
+glimpse(df)
+```
+
+```{r}
+# drop rest days, aggregate training stats per athlete
+features <- df %>%
+  filter(distance > 0) %>%
+  group_by(athlete) %>%
+  summarise(
+    avg_weekly_km = mean(distance, na.rm = TRUE),
+    total_km      = sum(distance, na.rm = TRUE),
+    avg_pace      = mean(duration / distance, na.rm = TRUE),
+    sessions      = n(),
+    age_group     = first(age_group),
+    gender        = first(gender)
+  )
+
+# one marathon per athlete, full marathon distance only (40-45km to include GPS error)
+marathon_rows <- df %>%
+  filter(major != "" & !is.na(major) & duration > 0 & distance >= 40 & distance <= 45) %>%
+  group_by(athlete) %>%
+  slice_max(duration, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(athlete, finish_time = duration)
+
+# join and filter to reasonable finish time range
+model_data <- features %>%
+  inner_join(marathon_rows, by = "athlete") %>%
+  filter(finish_time > 120, finish_time < 600) %>%
+  drop_na()
+
+glimpse(model_data)
+```
+
+```{r}
+# encode categorical features
+model_data <- model_data %>%
+  mutate(
+    gender_m   = as.integer(gender == "M"),
+    age_35_54  = as.integer(age_group == "35 - 54"),
+    age_55plus = as.integer(age_group == "55 +")
+  )
+
+# scale features, add intercept col
+X <- model_data %>%
+  select(avg_weekly_km, total_km, avg_pace, sessions, gender_m, age_35_54, age_55plus) %>%
+  scale() %>%
+  cbind(intercept = 1, .)
+
+y <- model_data$finish_time
+```
+
+```{r}
+set.seed(42)
+
+# log posterior: gaussian likelihood + priors on beta and sigma
+# intercept ~ N(240, 60), coefficients ~ N(0, 10), sigma ~ N(0, 20)
+log_posterior <- function(beta, sigma, X, y) {
+  if (sigma <= 0) return(-Inf)
+  mu   <- X %*% beta
+  ll   <- sum(dnorm(y, mean = mu, sd = sigma, log = TRUE))
+  lp_b <- sum(dnorm(beta[-1], 0, 10, log = TRUE))
+  lp_b <- lp_b + dnorm(beta[1], 240, 60, log = TRUE)
+  lp_s <- dnorm(sigma, 0, 20, log = TRUE)
+  return(ll + lp_b + lp_s)
+}
+
+# metropolis-hastings sampler, isotropic gaussian proposals
+metropolis <- function(n, X, y, prop_sd = 1.5, burn = 0.2) {
+  p            <- ncol(X)
+  total        <- floor(n / (1 - burn))
+  m            <- floor(total * burn)
+  beta         <- rep(0, p)
+  sigma        <- 30
+  samples_beta <- matrix(0, nrow = total, ncol = p)
+  samples_sig  <- numeric(total)
+  accepted     <- 0
+
+  for (i in 1:total) {
+    beta_prop  <- rnorm(p, beta, prop_sd)
+    sigma_prop <- abs(rnorm(1, sigma, prop_sd))
+    # acceptance ratio in log space for numerical stability
+    log_alpha  <- log_posterior(beta_prop, sigma_prop, X, y) -
+                  log_posterior(beta,      sigma,      X, y)
+    if (log(runif(1)) < log_alpha) {
+      beta     <- beta_prop
+      sigma    <- sigma_prop
+      accepted <- accepted + 1
+    }
+    samples_beta[i, ] <- beta
+    samples_sig[i]    <- sigma
+  }
+
+  cat("Acceptance rate:", round(accepted / total, 3), "\n")
+  # discard burn-in before returning
+  list(
+    beta  = samples_beta[(m + 1):total, ],
+    sigma = samples_sig[(m + 1):total]
+  )
+}
+
+trace <- metropolis(n = 10000, X = X, y = y, prop_sd = 1.5)
+```
+
+```{r}
+par_names <- c("intercept", "avg_weekly_km", "total_km", "avg_pace",
+               "sessions", "gender_m", "age_35_54", "age_55plus")
+
+# check convergence and mixing for each parameter
+for (i in 1:ncol(trace$beta)) {
+  plot(trace$beta[, i], type = "l",
+       main = paste("Convergence:", par_names[i]),
+       xlab = "Iteration", ylab = "Value")
+}
+
+for (i in 1:ncol(trace$beta)) {
+  acf(trace$beta[, i], main = paste("ACF:", par_names[i]))
+}
+```
+
+```{r posterior-summary}
+post_mean <- colMeans(trace$beta)
+post_ci   <- apply(trace$beta, 2, quantile, probs = c(0.05, 0.95))
+
+summary_df <- data.frame(
+  parameter = par_names,
+  mean      = round(post_mean, 3),
+  ci_5      = round(post_ci[1, ], 3),
+  ci_95     = round(post_ci[2, ], 3)
+)
+
+print(summary_df)
+```
+
+```{r coef-plot}
+ggplot(summary_df[-1, ], aes(x = mean, y = parameter)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = ci_5, xmax = ci_95), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "Posterior Means with 90% Credible Intervals",
+       x = "Posterior Mean", y = "") +
+  theme_minimal()
+```
+
+```{r predict}
+new_runner <- data.frame(
+  avg_weekly_km = 55,
+  total_km      = 800,
+  avg_pace      = 6.2,
+  sessions      = 80,
+  gender_m      = 1,
+  age_35_54     = 1,
+  age_55plus    = 0
+)
+
+# scale new runner using training data parameters
+X_train     <- model_data %>%
+  select(avg_weekly_km, total_km, avg_pace, sessions, gender_m, age_35_54, age_55plus)
+train_means <- colMeans(X_train)
+train_sds   <- apply(X_train, 2, sd)
+
+new_scaled  <- (new_runner - train_means) / train_sds
+new_x       <- c(1, as.numeric(new_scaled))
+
+# posterior predictive: one sample per posterior draw
+preds <- apply(trace$beta, 1, function(b) rnorm(1, mean = new_x %*% b, sd = mean(trace$sigma)))
+
+# drop anything below world record — kelvin kiptum, chicago 2023 (2:00:35)
+world_record <- 120.6
+preds        <- preds[preds >= world_record]
+
+cat("Median predicted finish time (min):", round(median(preds), 1), "\n")
+cat("90% CI:", round(quantile(preds, 0.05), 1), "-", round(quantile(preds, 0.95), 1), "\n")
+```
+
+```{r}
+# generate prediction plot - include a cutoff point at the world record time (normal distro would have unrealistic time constraints)
+data.frame(finish_time = preds) %>%
+  ggplot(aes(x = finish_time)) +
+  geom_histogram(bins = 50, fill = "#10B981", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = median(preds),         color = "red",    linewidth = 1, linetype = "dashed") +
+  geom_vline(xintercept = quantile(preds, 0.05), color = "gray40", linetype = "dotted") +
+  geom_vline(xintercept = quantile(preds, 0.95), color = "gray40", linetype = "dotted") +
+  geom_vline(xintercept = world_record,          color = "blue",   linewidth = 0.8, linetype = "solid") +
+  annotate("text", x = world_record + 2, y = Inf, label = "World Record (2:00:35)",
+           color = "blue", hjust = 0, vjust = 1.5, size = 3) +
+  labs(title = "Posterior Predictive Distribution",
+       subtitle = "Red = median, dotted = 90% CI, blue = world record cutoff",
+       x = "Predicted Finish Time (min)", y = "Count") +
+  theme_minimal()
+```
