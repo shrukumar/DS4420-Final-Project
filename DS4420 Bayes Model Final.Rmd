@@ -1,6 +1,6 @@
 ---
 title: "DS4420 Final Project Bayes Model"
-date: "`r Sys.Date()`"
+date: "April 15 2026"
 output: html_document
 ---
 
@@ -11,8 +11,8 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 ```{r}
 # download required libraries
 library(dplyr)
-library(tidyr)
 library(ggplot2)
+library(tidyr)
 ```
 
 ```{r}
@@ -61,13 +61,26 @@ model_data <- model_data %>%
     age_55plus = as.integer(age_group == "55 +")
   )
 
-# scale features, add intercept col
-X <- model_data %>%
-  select(avg_weekly_km, total_km, avg_pace, sessions, gender_m, age_35_54, age_55plus) %>%
-  scale() %>%
-  cbind(intercept = 1, .)
+# 80/20 train/test split
+set.seed(42)
+idx        <- sample(nrow(model_data), floor(0.8 * nrow(model_data)))
+train_data <- model_data[idx, ]
+test_data  <- model_data[-idx, ]
 
-y <- model_data$finish_time
+# scale features using training data, add intercept col
+train_matrix <- train_data %>%
+  select(avg_weekly_km, total_km, avg_pace, sessions, gender_m, age_35_54, age_55plus)
+train_means  <- colMeans(train_matrix)
+train_sds    <- apply(train_matrix, 2, sd)
+
+X <- scale(train_matrix) %>% cbind(intercept = 1, .)
+y <- train_data$finish_time
+
+X_test <- sweep(sweep(test_data %>%
+  select(avg_weekly_km, total_km, avg_pace, sessions, gender_m, age_35_54, age_55plus),
+  2, train_means, "-"), 2, train_sds, "/") %>%
+  cbind(intercept = 1, .)
+y_test <- test_data$finish_time
 ```
 
 ```{r}
@@ -119,7 +132,7 @@ metropolis <- function(n, X, y, prop_sd = 1.5, burn = 0.2) {
   )
 }
 
-trace <- metropolis(n = 10000, X = X, y = y, prop_sd = 1.5)
+trace <- metropolis(n = 10000, X = X, y = y, prop_sd = .4)
 ```
 
 ```{r}
@@ -138,10 +151,11 @@ for (i in 1:ncol(trace$beta)) {
 }
 ```
 
-```{r posterior-summary}
+```{r}
 post_mean <- colMeans(trace$beta)
 post_ci   <- apply(trace$beta, 2, quantile, probs = c(0.05, 0.95))
 
+#summarize posterior
 summary_df <- data.frame(
   parameter = par_names,
   mean      = round(post_mean, 3),
@@ -152,7 +166,8 @@ summary_df <- data.frame(
 print(summary_df)
 ```
 
-```{r coef-plot}
+```{r}
+#plot of coefficients
 ggplot(summary_df[-1, ], aes(x = mean, y = parameter)) +
   geom_point(size = 2) +
   geom_errorbarh(aes(xmin = ci_5, xmax = ci_95), height = 0.2) +
@@ -162,7 +177,27 @@ ggplot(summary_df[-1, ], aes(x = mean, y = parameter)) +
   theme_minimal()
 ```
 
-```{r predict}
+```{r}
+world_record <- 120.6
+
+# sample up to 100 test runners to keep runtime manageable
+set.seed(42)
+test_idx  <- sample(nrow(X_test), min(100, nrow(X_test)))
+X_test_s  <- X_test[test_idx, ]
+y_test_s  <- y_test[test_idx]
+
+# posterior predictive median for each test runner
+test_preds <- apply(X_test_s, 1, function(xrow) {
+  draws <- apply(trace$beta, 1, function(b) rnorm(1, mean = sum(xrow * b), sd = mean(trace$sigma)))
+  draws <- draws[draws >= world_record]
+  median(draws)
+})
+
+rmse <- sqrt(mean((test_preds - y_test_s)^2))
+cat("Test RMSE (min):", round(rmse, 2), "\n")
+```
+
+```{r}
 new_runner <- data.frame(
   avg_weekly_km = 55,
   total_km      = 800,
@@ -174,20 +209,14 @@ new_runner <- data.frame(
 )
 
 # scale new runner using training data parameters
-X_train     <- model_data %>%
-  select(avg_weekly_km, total_km, avg_pace, sessions, gender_m, age_35_54, age_55plus)
-train_means <- colMeans(X_train)
-train_sds   <- apply(X_train, 2, sd)
-
-new_scaled  <- (new_runner - train_means) / train_sds
-new_x       <- c(1, as.numeric(new_scaled))
+new_scaled <- (new_runner - train_means) / train_sds
+new_x      <- c(1, as.numeric(new_scaled))
 
 # posterior predictive: one sample per posterior draw
 preds <- apply(trace$beta, 1, function(b) rnorm(1, mean = new_x %*% b, sd = mean(trace$sigma)))
 
 # drop anything below world record — kelvin kiptum, chicago 2023 (2:00:35)
-world_record <- 120.6
-preds        <- preds[preds >= world_record]
+preds <- preds[preds >= world_record]
 
 cat("Median predicted finish time (min):", round(median(preds), 1), "\n")
 cat("90% CI:", round(quantile(preds, 0.05), 1), "-", round(quantile(preds, 0.95), 1), "\n")
