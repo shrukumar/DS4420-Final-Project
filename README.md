@@ -1,8 +1,8 @@
 ## DS4420 Machine Learning and Data Mining 2 Final Project by Shrutika Kumar, Gabrielle Bambalan, and Jackson Goodman
-#### Status: In Progress - Machine Learning to Optimize Marathon Training
+#### Machine Learning to Optimize Marathon Training
 
 This project aims to incorporate 3 different predictive models to analyze runner data.
-1) Time-series/ARIMA to predict running distance, duration, and other numeric statistics
+1) Time-series/ARIMA to predict running distance and other numeric statistics
 2) User-User Collaborative Filtering to find the most similar runners and form running-buddy recommendations based on geography, characteristics, and running statistics
 3) Bayesian Modeling to predict marathon finish times, modeling on daily, monthly, or weekly data
 
